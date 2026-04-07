@@ -57,7 +57,7 @@ pip install pyyaml jinja2
 ## 🛠 Установка
 
 ```
-git clone https://github.com/yourname/aviarity.git
+git clone https://github.com/getovh-dev/aviarity
 cd aviarity
 
 mkdir -p /opt/aviarity/templates
