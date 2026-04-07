@@ -1,0 +1,284 @@
+# =========================================
+# Aviarity Bird2 Automation
+# Version: 0.1
+# Telegram: @aviarity
+# =========================================
+
+router id {{ router_id }};
+
+ipv6 table master6;
+
+define OWNAS = {{ own_as }};
+define MAX_PREFIX_LEN = 48;
+define MIN_PREFIX_LEN = 12;
+
+roa6 table rpki6;
+
+protocol rpki rpki_cloudflare {
+    roa6 { table rpki6; };
+    remote "rtr.rpki.cloudflare.com" port 8282;
+    retry 10;
+    refresh 300;
+    expire 3600;
+}
+
+define OWN_PREFIXES = [
+{% for prefix in own_prefixes %}
+    {{ prefix }}{{ "," if not loop.last else "" }}
+{% endfor %}
+];
+
+define BOGON_PREFIXES_V6 = [
+    ::/8{8,128},
+    0100::/64{64,128},
+    2001:2::/48{48,128},
+    2001:10::/28{28,128},
+    2001:db8::/32{32,128},
+    3ffe::/16{16,128},
+    fc00::/7{7,128},
+    fe80::/10{10,128},
+    fec0::/10{10,128},
+    ff00::/8{8,128}
+];
+
+define BOGON_ASNS = [
+    0, 23456, 64496..64511, 64512..65534, 65535,
+    65536..65551, 65552..131071, 4200000000..4294967294,
+    4294967295
+];
+
+{% for ds in downstreams %}
+define LC_DS_{{ ds.name | upper }} = ({{ own_as }}, 300, {{ ds.remote_as }});
+{% endfor %}
+{% for client in byoip %}
+define LC_BYOIP_{{ client.name | upper }} = ({{ own_as }}, 400, {{ client.private_as }});
+{% endfor %}
+
+protocol device {
+    scan time 10;
+}
+
+protocol direct {
+    ipv6;
+}
+
+protocol kernel kernel6 {
+    ipv6 {
+        import none;
+        export filter {
+            krt_prefsrc = {{ kernel_prefsrc }};
+            if source = RTS_BGP then accept;
+            reject;
+        };
+    };
+    merge paths on;
+}
+
+function is_bogon() {
+    if net ~ BOGON_PREFIXES_V6 then return true;
+    return false;
+}
+
+function has_bogon_asn() {
+    if bgp_path ~ BOGON_ASNS then return true;
+    return false;
+}
+
+function honor_graceful_shutdown() {
+    if (65535, 0) ~ bgp_community then {
+        bgp_local_pref = 0;
+    }
+}
+
+function import_checks() {
+    if is_bogon() then return false;
+    if has_bogon_asn() then return false;
+    if net.len > MAX_PREFIX_LEN then return false;
+    if net.len < MIN_PREFIX_LEN then return false;
+    if bgp_path.len > 64 then return false;
+    if bgp_path.len = 0 then return false;
+    if roa_check(rpki6, net, bgp_path.last) = ROA_INVALID then return false;
+    return true;
+}
+
+filter import_upstream {
+    if net ~ OWN_PREFIXES then reject;
+    if !import_checks() then reject;
+    honor_graceful_shutdown();
+    accept;
+}
+
+template bgp UPSTREAMS {
+    local as OWNAS;
+    hold time 90;
+    keepalive time 30;
+    graceful restart on;
+    connect retry time 10;
+    error wait time 30, 300;
+    ipv6 {
+        import limit 500000 action restart;
+        receive limit 600000 action disable;
+        import keep filtered;
+    };
+}
+
+template bgp IXP {
+    local as OWNAS;
+    hold time 90;
+    keepalive time 30;
+    graceful restart on;
+    connect retry time 10;
+    error wait time 30, 300;
+    default bgp_local_pref 90;
+    ipv6 {
+        import limit 500000 action restart;
+        receive limit 600000 action disable;
+        import keep filtered;
+    };
+}
+
+template bgp DOWNSTREAMS {
+    local as OWNAS;
+    hold time 90;
+    keepalive time 30;
+    graceful restart on;
+    connect retry time 10;
+    error wait time 30, 300;
+    default bgp_local_pref 150;
+    ipv6 {
+        import keep filtered;
+    };
+}
+
+template bgp BYOIP {
+    local as OWNAS;
+    hold time 90;
+    keepalive time 30;
+    graceful restart on;
+    connect retry time 10;
+    error wait time 30, 300;
+    default bgp_local_pref 150;
+    ipv6 {
+        import keep filtered;
+    };
+}
+
+{% for peer in upstreams %}
+filter export_{{ peer.name }} {
+    if net ~ [
+{% for prefix in peer.export_prefixes %}
+        {{ prefix }}{{ "," if not loop.last else "" }}
+{% endfor %}
+    ] then accept;
+    reject;
+}
+
+protocol bgp {{ peer.name }}_v6 from UPSTREAMS {
+    description "{{ peer.description }}";
+    local {{ peer.local_ip }} as OWNAS;
+    neighbor {{ peer.neighbor_ip }} as {{ peer.remote_as }};
+    multihop;
+    ipv6 {
+        import filter import_upstream;
+        export filter export_{{ peer.name }};
+    };
+}
+{% endfor %}
+
+{% for ds in downstreams %}
+filter import_{{ ds.name }} {
+    if is_bogon() then reject;
+    if has_bogon_asn() then reject;
+    if net.len > MAX_PREFIX_LEN then reject;
+    if net.len < MIN_PREFIX_LEN then reject;
+    if bgp_path.len > 64 then reject;
+    if bgp_path.first != {{ ds.remote_as }} then reject;
+    bgp_large_community.add(LC_DS_{{ ds.name | upper }});
+    accept;
+}
+
+protocol bgp {{ ds.name }}_v6 from DOWNSTREAMS {
+    description "{{ ds.description }}";
+    local {{ ds.local_ip }} as OWNAS;
+    neighbor {{ ds.neighbor_ip }} as {{ ds.remote_as }};
+    ipv6 {
+        import limit {{ ds.import_limit }} action restart;
+        import filter import_{{ ds.name }};
+{% if ds.export_full_table is defined and ds.export_full_table %}
+        export all;
+{% else %}
+        export filter import_upstream;
+{% endif %}
+    };
+}
+{% endfor %}
+
+{% for client in byoip %}
+filter import_{{ client.name }} {
+    if is_bogon() then reject;
+    if net.len > MAX_PREFIX_LEN then reject;
+    if net.len < MIN_PREFIX_LEN then reject;
+    bgp_path.delete({{ client.private_as }});
+    bgp_large_community.add(LC_BYOIP_{{ client.name | upper }});
+    accept;
+}
+
+protocol bgp {{ client.name }}_v6 from BYOIP {
+    description "{{ client.description }}";
+    local {{ client.local_ip }} as OWNAS;
+    neighbor {{ client.neighbor_ip }} as {{ client.private_as }};
+    ipv6 {
+        import limit {{ client.import_limit }} action restart;
+        import filter import_{{ client.name }};
+{% if client.export_full_table is defined and client.export_full_table %}
+        export all;
+{% else %}
+        export filter import_upstream;
+{% endif %}
+    };
+}
+{% endfor %}
+
+filter ixp_import {
+    if net ~ OWN_PREFIXES then reject;
+    if !import_checks() then reject;
+    honor_graceful_shutdown();
+    accept;
+}
+
+filter ixp_export {
+    if net ~ OWN_PREFIXES then accept;
+{% for ds in downstreams %}
+    if bgp_large_community ~ [({{ own_as }}, 300, {{ ds.remote_as }})] then accept;
+{% endfor %}
+{% for client in byoip %}
+    if bgp_large_community ~ [({{ own_as }}, 400, {{ client.private_as }})] then accept;
+{% endfor %}
+    reject;
+}
+
+{% for ixp in ixps %}
+protocol bgp {{ ixp.name }}_v6 from IXP {
+    description "{{ ixp.description }}";
+    local {{ ixp.local_ip }} as OWNAS;
+    neighbor {{ ixp.neighbor_ip }} as {{ ixp.remote_as }};
+    ipv6 {
+        import filter ixp_import;
+        export filter ixp_export;
+    };
+}
+{% endfor %}
+
+{% for col in collectors %}
+protocol bgp {{ col.name }}_v6 {
+    description "{{ col.description }}";
+    local {{ col.local_ip }} as OWNAS;
+    neighbor {{ col.neighbor_ip }} as {{ col.remote_as }};
+{% if col.multihop %} multihop; {% endif %}
+    ipv6 {
+        import none;
+        export all;
+{% if col.add_paths %} add paths tx; {% endif %}
+    };
+}
+{% endfor %}
