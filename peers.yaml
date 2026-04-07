@@ -1,0 +1,59 @@
+# =========================================
+# Aviarity Bird2 Automation
+# Version: 0.1
+# Telegram: @aviarity
+# =========================================
+
+router_id: "10.0.0.1"
+own_as: 65001
+kernel_prefsrc: "fd00:1::1"
+
+own_prefixes:
+  - "fd00:100::/48"
+
+upstreams:
+  - name: "upstream1"
+    description: "Пример Upstream AS 65010"
+    remote_as: 65010
+    local_ip: "fd00:1::2"
+    neighbor_ip: "fd00:1::3"
+    export_prefixes:
+      - "fd00:100::/48"
+
+downstreams:
+  - name: "downstream1"
+    description: "Пример Downstream AS 65020"
+    remote_as: 65020
+    local_ip: "fd00:2::2"
+    neighbor_ip: "fd00:2::3"
+    import_limit: 5000
+    export_full_table: true
+    announce_via:
+      - "upstream1"
+
+byoip:
+  - name: "byoip1"
+    description: "Пример BYOIP клиента"
+    private_as: 65501
+    local_ip: "fd00:3::2"
+    neighbor_ip: "fd00:3::3"
+    import_limit: 2000
+    export_full_table: true
+    announce_via:
+      - "upstream1"
+
+ixps:
+  - name: "ixp1"
+    description: "Пример IXP"
+    remote_as: 65030
+    local_ip: "fd00:4::2"
+    neighbor_ip: "fd00:4::3"
+
+collectors:
+  - name: "collector1"
+    description: "Пример Collector"
+    remote_as: 65040
+    local_ip: "fd00:5::2"
+    neighbor_ip: "fd00:5::3"
+    multihop: true
+    add_paths: true
